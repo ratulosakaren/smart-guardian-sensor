@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Study Sensor Streamer</title>
+  <!-- Library MQTT via CDN -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f4f6f8; color: #222; }
+    .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); max-width: 480px; margin: 0 auto; }
+    h2 { margin-top: 0; font-size: 1.25rem; }
+    label { display: block; margin-top: 12px; font-weight: 600; font-size: 0.9rem; }
+    select, input, button { width: 100%; padding: 10px; margin-top: 5px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; font-size: 1rem; }
+    button { background: #007bff; color: white; font-weight: bold; border: none; margin-top: 20px; cursor: pointer; }
+    button.stop { background: #dc3545; }
+    .status { margin-top: 15px; font-weight: bold; }
+    pre { background: #eee; padding: 10px; border-radius: 6px; font-size: 0.85rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h2>IoT Sensor Publisher</h2>
+  
+  <label for="deviceType">Pilih Peran Perangkat:</label>
+  <select id="deviceType" onchange="updatePreset()">
+    <option value="desk">HP 1 - Meja (Android: Accelerometer)</option>
+    <option value="user">HP 2 - Pengguna (iPhone: Orientation)</option>
+  </select>
+
+  <label for="topic">Topik MQTT:</label>
+  <input type="text" id="topic" value="guardian/desk/acceleration">
+
+  <button id="btnAction" onclick="toggleStream()">1. Izinkan Sensor & Mulai Kirim</button>
+
+  <div class="status" id="statusText">Status: Standby</div>
+  <pre id="dataPreview">Menunggu data...</pre>
+</div>
+
+<script>
+  let client = null;
+  let isRunning = false;
+  let lastData = {};
+  let sendInterval = null;
+
+  const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+
+  function updatePreset() {
+    const role = document.getElementById("deviceType").value;
+    if (role === "desk") {
+      document.getElementById("topic").value = "guardian/desk/acceleration";
+    } else {
+      document.getElementById("topic").value = "guardian/user/orientation";
+    }
+  }
+
+  async function requestPermissions() {
+    // Penanganan khusus untuk iOS/iPhone (wajib meminta requestPermission)
+    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+      try {
+        const response = await DeviceOrientationEvent.requestPermission();
+        if (response !== "granted") {
+          alert("Izin sensor orientasi ditolak.");
+          return false;
+        }
+      } catch (e) {
+        console.error("Gagal meminta izin orientasi:", e);
+      }
+    }
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+      try {
+        const response = await DeviceMotionEvent.requestPermission();
+        if (response !== "granted") {
+          alert("Izin sensor gerak ditolak.");
+          return false;
+        }
+      } catch (e) {
+        console.error("Gagal meminta izin gerak:", e);
+      }
+    }
+    return true;
+  }
+
+  async function toggleStream() {
+    const btn = document.getElementById("btnAction");
+    const status = document.getElementById("statusText");
+
+    if (isRunning) {
+      stopStreaming();
+      btn.innerText = "Mulai Kirim";
+      btn.classList.remove("stop");
+      status.innerText = "Status: Berhenti";
+      isRunning = false;
+      return;
+    }
+
+    const permitted = await requestPermissions();
+    if (!permitted) return;
+
+    status.innerText = "Menghubungkan ke MQTT...";
+    const clientId = "guardian_dev_" + Math.random().toString(16).substr(2, 8);
+
+    client = mqtt.connect(BROKER_URL, { clientId: clientId });
+
+    client.on("connect", () => {
+      status.innerText = "Status: Terhubung & Mengirim Data";
+      btn.innerText = "Hentikan Kirim";
+      btn.classList.add("stop");
+      isRunning = true;
+      startSensors();
+    });
+
+    client.on("error", (err) => {
+      status.innerText = "Koneksi Error: " + err.message;
+      stopStreaming();
+    });
+  }
+
+  function handleMotion(e) {
+    // Ambil akselerasi tanpa gravitasi bila tersedia, atau akselerasi total
+    const acc = e.accelerationIncludingGravity || e.acceleration || { x: 0, y: 0, z: 0 };
+    lastData = {
+      x: Number((acc.x || 0).toFixed(2)),
+      y: Number((acc.y || 0).toFixed(2)),
+      z: Number((acc.z || 0).toFixed(2))
+    };
+  }
+
+  function handleOrientation(e) {
+    lastData = {
+      pitch: Number((e.beta || 0).toFixed(2)),   // Derajat kemiringan depan/belakang
+      roll: Number((e.gamma || 0).toFixed(2)),   // Derajat kemiringan kiri/kanan
+      yaw: Number((e.alpha || 0).toFixed(2))     // Arah kompas
+    };
+  }
+
+  function startSensors() {
+    const role = document.getElementById("deviceType").value;
+    const topic = document.getElementById("topic").value;
+
+    if (role === "desk") {
+      window.addEventListener("devicemotion", handleMotion, true);
+    } else {
+      window.addEventListener("deviceorientation", handleOrientation, true);
+    }
+
+    // Kirim data setiap 100 ms (10 kali per detik)
+    sendInterval = setInterval(() => {
+      if (client && client.connected && Object.keys(lastData).length > 0) {
+        const payload = JSON.stringify(lastData);
+        client.publish(topic, payload);
+        document.getElementById("dataPreview").innerText = `Topik: ${topic}\nData: ${payload}`;
+      }
+    }, 100);
+  }
+
+  function stopStreaming() {
+    window.removeEventListener("devicemotion", handleMotion, true);
+    window.removeEventListener("deviceorientation", handleOrientation, true);
+    if (sendInterval) clearInterval(sendInterval);
+    if (client) client.end();
+  }
+</script>
+
+</body>
+</html>
